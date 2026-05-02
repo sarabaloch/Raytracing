@@ -41,6 +41,12 @@ World::~World() {
     }
     geometry.clear();
 
+    // Delete unbounded geometry.
+    for (int i = 0; i < (int)unbounded_geometry.size(); i++) {
+        delete unbounded_geometry[i];
+    }
+    unbounded_geometry.clear();
+
     // Delete all lights.
     for (int i = 0; i < (int)lights.size(); i++) {
         delete lights[i];
@@ -69,6 +75,10 @@ void World::add_geometry(Geometry* geom_ptr) {
     geometry.push_back(geom_ptr);
 }
 
+void World::add_unbounded_geometry(Geometry* geom_ptr) {
+    unbounded_geometry.push_back(geom_ptr);
+}
+
 
 // ---------------------------------------------------------------------------
 // add_light()
@@ -94,26 +104,34 @@ void World::set_camera(Camera* new_camera) {
 // ---------------------------------------------------------------------------
 ShadeInfo World::hit_objects(const Ray& ray) {
 
-    // If an acceleration structure is available, use it.
-    if (accel_ptr != nullptr) {
-        return accel_ptr->hit(ray, *this);
-    }
-
-    // Brute-force: test every geometry object.
     ShadeInfo closest(*this);
     float smallest_t = kHugeValue;
 
-    for (int i = 0; i < (int)geometry.size(); i++) {
-        float     object_t    = kHugeValue;
-        ShadeInfo object_info(*this);
-
-        bool did_hit = geometry[i]->hit(ray, object_t, object_info);
-
-        if (did_hit) {
-            if (object_t < smallest_t) {
+    // Test bounded geometry (via BVH or brute force).
+    if (accel_ptr != nullptr) {
+        ShadeInfo bvh_info = accel_ptr->hit(ray, *this);
+        if (bvh_info.hit && bvh_info.t < smallest_t) {
+            smallest_t = bvh_info.t;
+            closest    = bvh_info;
+        }
+    } else {
+        for (int i = 0; i < (int)geometry.size(); i++) {
+            float     object_t    = kHugeValue;
+            ShadeInfo object_info(*this);
+            if (geometry[i]->hit(ray, object_t, object_info) && object_t < smallest_t) {
                 smallest_t = object_t;
                 closest    = object_info;
             }
+        }
+    }
+
+    // Always test unbounded geometry (planes etc.) directly — never through BVH.
+    for (int i = 0; i < (int)unbounded_geometry.size(); i++) {
+        float     object_t    = kHugeValue;
+        ShadeInfo object_info(*this);
+        if (unbounded_geometry[i]->hit(ray, object_t, object_info) && object_t < smallest_t) {
+            smallest_t = object_t;
+            closest    = object_info;
         }
     }
 
@@ -128,22 +146,18 @@ ShadeInfo World::hit_objects(const Ray& ray) {
 // ---------------------------------------------------------------------------
 bool World::in_shadow(const Ray& shadow_ray, float max_distance) const {
 
-    // If an acceleration structure is available, use it.
+    // Test via BVH or brute force.
     if (accel_ptr != nullptr) {
-        return accel_ptr->shadow_hit(shadow_ray, max_distance);
+        if (accel_ptr->shadow_hit(shadow_ray, max_distance)) return true;
+    } else {
+        for (int i = 0; i < (int)geometry.size(); i++) {
+            if (geometry[i]->shadow_hit(shadow_ray, max_distance)) return true;
+        }
     }
 
-    // Brute-force: test every geometry object.
-    for (int i = 0; i < (int)geometry.size(); i++) {
-        float t = kHugeValue;
-
-        bool did_hit = geometry[i]->shadow_hit(shadow_ray, t);
-
-        if (did_hit) {
-            if (t < max_distance) {
-                return true;    // something blocks the light
-            }
-        }
+    // Also test unbounded geometry.
+    for (int i = 0; i < (int)unbounded_geometry.size(); i++) {
+        if (unbounded_geometry[i]->shadow_hit(shadow_ray, max_distance)) return true;
     }
 
     return false;

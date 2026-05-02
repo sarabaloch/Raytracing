@@ -9,6 +9,7 @@
 
 #include "Camera.hpp"
 
+#include "../utilities/Point3D.hpp"
 #include "../utilities/Vector3D.hpp"
 
 class Parallel : public Camera {
@@ -31,4 +32,7 @@ public:
 
   // Get direction of projection for a point.
   virtual Vector3D get_direction(const Point3D &p) const;
+
+  // Parallel: ray originates from the sample point on the view plane.
+  virtual Point3D get_origin(const Point3D& sample_point) const { return sample_point; }
 };

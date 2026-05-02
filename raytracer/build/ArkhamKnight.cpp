@@ -294,7 +294,7 @@ void World::build(void)
         Vector3D(0.0f, 1.0f, 0.0f)
     );
     ground->set_material(new StreetWetAsphalt(0.030f, 0.032f, 0.038f, 0.74f));
-    add_geometry(ground);
+    add_unbounded_geometry(ground);
 
     Box* road_ns_near = new Box(
         Point3D(-11.0f, -54.32f, -240.0f),

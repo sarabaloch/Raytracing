@@ -50,9 +50,11 @@ public:
         return direction;
     }
 
-    // Returns color * intensity.
+    // Returns color * intensity, attenuated by inverse-square distance falloff.
     virtual RGBColor get_radiance(const ShadeInfo& sinfo) const override {
-        return color * intensity;
+        float dist = sinfo.hit_point.distance(position);
+        float attenuation = 1.0f / (1.0f + 0.01f * dist * dist);
+        return color * intensity * attenuation;
     }
 
     // Returns the actual distance from the hit point to the light.

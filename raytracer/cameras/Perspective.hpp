@@ -33,4 +33,7 @@ public:
 
   // Get direction of projection for a point.
   virtual Vector3D get_direction(const Point3D &p) const;
+
+  // Perspective: ray always originates from the eye, ignores sample_point.
+  virtual Point3D get_origin(const Point3D& /*sample_point*/) const { return pos; }
 };

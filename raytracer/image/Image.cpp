@@ -4,6 +4,7 @@
 #include "../utilities/RGBColor.hpp"
 #include "../world/ViewPlane.hpp"
 #include <vector>
+#include <cmath>
 
 Image::Image(int horizontalRes, int verticalRes): hres(horizontalRes), vres(verticalRes) {
 
@@ -35,9 +36,18 @@ void Image::write_png(std::string path) const {
             const RGBColor &pixelColor = colors[x][y];
 
             int index = (y * hres + x) * colours;
-            imageBytes[index + 0] = static_cast<unsigned char>(pixelColor.r * 255.0f);
-            imageBytes[index + 1] = static_cast<unsigned char>(pixelColor.g * 255.0f);
-            imageBytes[index + 2] = static_cast<unsigned char>(pixelColor.b * 255.0f);
+    auto tobyte = [](float v) -> unsigned char {
+        // Reinhard tone mapping: maps HDR [0,inf) to [0,1), then to [0,255]
+        v = v / (1.0f + v);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        // Gamma correction (approximate sRGB)
+        v = std::pow(v, 1.0f / 2.2f);
+        return static_cast<unsigned char>(v * 255.0f);
+    };
+    imageBytes[index + 0] = tobyte(pixelColor.r);
+    imageBytes[index + 1] = tobyte(pixelColor.g);
+    imageBytes[index + 2] = tobyte(pixelColor.b);
         }
     }
 

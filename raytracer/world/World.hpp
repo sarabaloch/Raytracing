@@ -32,7 +32,8 @@ public:
 
     ViewPlane               vplane;         // the view plane
     RGBColor                bg_color;       // background color
-    std::vector<Geometry*>  geometry;       // all geometry in the scene
+    std::vector<Geometry*>  geometry;       // all geometry in the scene (goes into BVH)
+    std::vector<Geometry*>  unbounded_geometry; // infinite objects (planes) tested separately
     std::vector<Light*>     lights;         // all light sources
     Camera*                 camera_ptr;     // the camera
     Sampler*                sampler_ptr;    // the sampler
@@ -49,6 +50,9 @@ public:
 
     // Add geometry to the scene.
     void add_geometry(Geometry* geom_ptr);
+
+    // Add an infinite/unbounded object (e.g. Plane) — tested outside the BVH.
+    void add_unbounded_geometry(Geometry* geom_ptr);
 
     // Add a light source to the scene.
     void add_light(Light* light_ptr);
