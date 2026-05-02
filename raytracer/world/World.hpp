@@ -1,51 +1,69 @@
 #pragma once
 
 /**
-   This file declares the World class which contains all the information about
-   the scene - geometry and materials, lights, viewplane, camera, samplers, and
-   acceleration structures.
-
-   It also traces rays through the scene.
-
-   Courtesy Kevin Suffern.
-*/
+ * World.hpp
+ *
+ * The World holds everything in the scene:
+ *   - All geometry objects
+ *   - All light sources
+ *   - The view plane, camera, and sampler
+ *   - A tracer (Basic or Shadow)
+ *   - An optional acceleration structure (BVH)
+ *
+ * Courtesy Kevin Suffern. Extended for CS 440 Project 2.
+ */
 
 #include <vector>
 
 #include "../utilities/RGBColor.hpp"
-
 #include "ViewPlane.hpp"
 
 class Camera;
 class Geometry;
+class Light;
 class Ray;
 class Sampler;
 class ShadeInfo;
+class Tracer;
+class Acceleration;
 
 class World {
 public:
-  ViewPlane vplane;
-  RGBColor bg_color;
-  std::vector<Geometry *> geometry;
-  Camera *camera_ptr;
-  Sampler *sampler_ptr;
+
+    ViewPlane               vplane;         // the view plane
+    RGBColor                bg_color;       // background color
+    std::vector<Geometry*>  geometry;       // all geometry in the scene
+    std::vector<Light*>     lights;         // all light sources
+    Camera*                 camera_ptr;     // the camera
+    Sampler*                sampler_ptr;    // the sampler
+    Tracer*                 tracer_ptr;     // the tracer (Basic or Shadow)
+    Acceleration*           accel_ptr;      // BVH (null = brute force)
 
 public:
-  // Constructors.
-  World(); // initialize members.
 
-  // Destructor.
-  ~World(); // free memory.
+    // Constructor — sets all pointers to null.
+    World();
 
-  // Add to the scene.
-  void add_geometry(Geometry *geom_ptr);
-  void set_camera(Camera *c_ptr);
+    // Destructor — frees all heap memory.
+    ~World();
 
-  // Build scene - add all geometry, materials, lights, viewplane, camera,
-  // samplers, and acceleration structures
-  void build();
+    // Add geometry to the scene.
+    void add_geometry(Geometry* geom_ptr);
 
-  // Returns appropriate shading information corresponding to intersection of
-  // the ray with the scene geometry.
-  ShadeInfo hit_objects(const Ray &ray);
+    // Add a light source to the scene.
+    void add_light(Light* light_ptr);
+
+    // Set the camera (deletes the old one first).
+    void set_camera(Camera* c_ptr);
+
+    // Build the scene — defined in a separate build/*.cpp file.
+    void build();
+
+    // Test a ray against all geometry and return shading info for the closest hit.
+    // Uses BVH if accel_ptr is set, otherwise brute-force.
+    ShadeInfo hit_objects(const Ray& ray);
+
+    // Test a shadow ray: returns true if anything blocks it before max_distance.
+    // Uses BVH if accel_ptr is set, otherwise brute-force.
+    bool in_shadow(const Ray& shadow_ray, float max_distance) const;
 };

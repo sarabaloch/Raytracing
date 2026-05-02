@@ -39,6 +39,9 @@ public:
   // Ray intersection. Set t and sinfo as per intersection with this object.
   virtual bool hit(const Ray &ray, float &t, ShadeInfo &sinfo) const = 0;
 
+  // Shadow ray intersection. Returns true if ray hits this object within max_distance.
+  virtual bool shadow_hit(const Ray &ray, float max_distance) const;
+
   // Get bounding box.
   virtual BBox getBBox() const = 0;
 };

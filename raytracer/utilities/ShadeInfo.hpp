@@ -30,7 +30,8 @@ public:
   const World *w;         // pointer to the world.
 
 public:
-  // Constructor.
+  // Constructors.
+  ShadeInfo();                // default: no world (for shadow rays).
   ShadeInfo(const World &wr); // set the world.
 
   // Copy constructor.

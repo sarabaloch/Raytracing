@@ -1,20 +1,31 @@
 /**
  * ArkhamKnight.cpp
  *
- * A rain-soaked Gotham rooftop scene viewed from above a building deck.
- * The camera looks out over the city skyline. The moon hangs high and
- * left, casting cold blue light over wet concrete, glass towers, and
- * neon-lit streets far below.
+ * Rain-soaked Gotham rooftop scene.
  *
- * Scene elements:
- *   - Moon (emissive sphere, matches SceneLights::moon_center())
- *   - Rooftop deck with puddles, parapets, and HVAC units
- *   - Six city tower blocks with glass strips and window bands
- *   - Wet street basin with arterial roads
- *   - Four neon light sources floating above the skyline
- *   - Rain streaks falling across the frame
+ * The camera stands on a high rooftop deck and looks out over the city
+ * skyline. The moon hangs high and left, casting cold blue light over wet
+ * concrete, reflective glass towers, neon signs, and rain-slicked streets
+ * far below.
+ *
+ * To reach 1 million primitives the scene fills the city volume with:
+ *   - 8 major tower blocks (the hero buildings, visible in foreground)
+ *   - A grid of 300 x 300 = 90,000 background city blocks (the sprawl)
+ *   - 900,000 rain drop spheres scattered across the frame volume
+ *   - Rooftop detail: deck slab, puddles, parapets, HVAC units
+ *   - Street basin + 4 arterial road slabs
+ *   - Moon sphere, 4 neon glow spheres
+ *
+ * Features used:
+ *   - Shadow tracer  (world.tracer_ptr = new Shadow)
+ *   - Jittered sampler 2x2  (world.sampler_ptr = new Jittered(..., 2))
+ *   - BVH acceleration  (world.accel_ptr = new BVH)
+ *   - DirectionalLight for the moon
+ *   - PointLights for each neon sign
+ *   - MoonLitWetConcrete, StreetWetAsphalt, Reflective, Emissive, RainStreakMat
  */
 
+#include "../acceleration/BVH.hpp"
 #include "../cameras/Perspective.hpp"
 #include "../extras/Box.hpp"
 #include "../extras/Emissive.hpp"
@@ -25,19 +36,19 @@
 #include "../extras/StreetWetAsphalt.hpp"
 #include "../geometry/Plane.hpp"
 #include "../geometry/Sphere.hpp"
+#include "../lights/DirectionalLight.hpp"
+#include "../lights/PointLight.hpp"
 #include "../materials/Cosine.hpp"
-#include "../samplers/Simple.hpp"
+#include "../samplers/Jittered.hpp"
+#include "../tracers/Shadow.hpp"
 #include "../world/World.hpp"
 
 #include <cmath>
+#include <cstdlib>
 
 
 // ---------------------------------------------------------------------------
-// Helper: add one city tower block to the scene
-//   x0, x1  = left and right X bounds
-//   z0, z1  = far and near Z bounds
-//   y0, y1  = bottom and top Y bounds
-//   wetness = how rain-soaked the concrete looks (0=dry, 1=soaked)
+// Helper: add one city tower block
 // ---------------------------------------------------------------------------
 static void add_tower(World* world,
                       float x0, float x1,
@@ -45,10 +56,10 @@ static void add_tower(World* world,
                       float y0, float y1,
                       float wetness)
 {
-    Point3D corner_min(x0, y0, z0);
-    Point3D corner_max(x1, y1, z1);
+    Point3D min_corner(x0, y0, z0);
+    Point3D max_corner(x1, y1, z1);
 
-    Box* tower = new Box(corner_min, corner_max);
+    Box* tower = new Box(min_corner, max_corner);
     tower->set_material(new MoonLitWetConcrete(0.052f, 0.057f, 0.074f, wetness));
 
     world->add_geometry(tower);
@@ -56,21 +67,17 @@ static void add_tower(World* world,
 
 
 // ---------------------------------------------------------------------------
-// Helper: add a glass curtain-wall strip on one face of a tower
-//   x0, x1    = horizontal span
-//   y0, y1    = vertical span
-//   z_near    = Z position of the glass face
-//   z_thick   = how thick the glass slab is
+// Helper: add a glass curtain-wall strip on a tower face
 // ---------------------------------------------------------------------------
 static void add_glass_strip(World* world,
                              float x0, float x1,
                              float y0, float y1,
                              float z_near, float z_thick)
 {
-    Point3D corner_min(x0, y0, z_near);
-    Point3D corner_max(x1, y1, z_near + z_thick);
+    Point3D min_corner(x0, y0, z_near);
+    Point3D max_corner(x1, y1, z_near + z_thick);
 
-    Box* glass = new Box(corner_min, corner_max);
+    Box* glass = new Box(min_corner, max_corner);
     glass->set_material(new Reflective(0.12f, 0.16f, 0.24f, 0.88f, 2.55f));
 
     world->add_geometry(glass);
@@ -78,21 +85,17 @@ static void add_glass_strip(World* world,
 
 
 // ---------------------------------------------------------------------------
-// Helper: add one row of dark window recesses on a tower face
-//   x0, x1   = horizontal span of the window row
-//   y0, y1   = vertical span of this row
-//   z_face   = Z position of the wall face the windows sit on
-//   inset    = how far the window is recessed into the wall
+// Helper: add one row of dark window recesses
 // ---------------------------------------------------------------------------
 static void add_window_band(World* world,
                              float x0, float x1,
                              float y0, float y1,
                              float z_face, float inset)
 {
-    Point3D corner_min(x0, y0, z_face - inset);
-    Point3D corner_max(x1, y1, z_face + 0.06f);
+    Point3D min_corner(x0, y0, z_face - inset);
+    Point3D max_corner(x1, y1, z_face + 0.06f);
 
-    Box* window = new Box(corner_min, corner_max);
+    Box* window = new Box(min_corner, max_corner);
     window->set_material(new Cosine(0.022f, 0.028f, 0.038f));
 
     world->add_geometry(window);
@@ -100,10 +103,7 @@ static void add_window_band(World* world,
 
 
 // ---------------------------------------------------------------------------
-// Helper: add a neon glow sphere at a point in the skyline
-//   x, y, z       = position
-//   r, g, b       = colour of the neon light
-//   radiance      = brightness multiplier
+// Helper: add a neon glow sphere
 // ---------------------------------------------------------------------------
 static void add_neon(World* world,
                      float x, float y, float z,
@@ -121,22 +121,18 @@ static void add_neon(World* world,
 
 // ---------------------------------------------------------------------------
 // Helper: add one thin vertical rain streak box
-//   x         = X position of the streak
-//   y_mid     = Y centre of the streak
-//   z         = Z position
-//   span      = total height of the streak
 // ---------------------------------------------------------------------------
 static void add_rain_streak(World* world,
                              float x, float y_mid,
                              float z, float span)
 {
-    float half_span = span * 0.5f;
-    float thickness = 0.048f;
+    float half   = span * 0.5f;
+    float thick  = 0.048f;
 
-    Point3D corner_min(x - thickness, y_mid - half_span, z - thickness);
-    Point3D corner_max(x + thickness, y_mid + half_span, z + thickness);
+    Point3D min_corner(x - thick, y_mid - half, z - thick);
+    Point3D max_corner(x + thick, y_mid + half, z + thick);
 
-    Box* streak = new Box(corner_min, corner_max);
+    Box* streak = new Box(min_corner, max_corner);
     streak->set_material(new RainStreakMat());
 
     world->add_geometry(streak);
@@ -145,38 +141,93 @@ static void add_rain_streak(World* world,
 
 // ---------------------------------------------------------------------------
 // World::build
-//   Sets up the entire Arkham Knight rooftop scene.
 // ---------------------------------------------------------------------------
 void World::build(void)
 {
     // ------------------------------------------------------------------
     // View plane
-    //   The plane sits at z=10, just in front of the camera.
-    //   Rays travel into negative Z (toward the city).
     // ------------------------------------------------------------------
     vplane.top_left     = Point3D(-26.0f,  48.0f, 10.0f);
     vplane.bottom_right = Point3D( 26.0f,  12.0f, 10.0f);
     vplane.hres         = 960;
     vplane.vres         = 540;
 
-    // Dark bruised-sky background colour
+    // Dark bruised-sky background colour.
     bg_color = RGBColor(0.042f, 0.058f, 0.098f);
 
+
     // ------------------------------------------------------------------
-    // Camera and sampler
-    //   Camera stands on the rooftop deck, looking out over the city.
+    // Camera — standing on the rooftop deck, looking over the city.
     // ------------------------------------------------------------------
     set_camera(new Perspective(1.95f, 41.92f, 23.85f));
-    sampler_ptr = new Simple(camera_ptr, &vplane);
+
+
+    // ------------------------------------------------------------------
+    // Sampler — Jittered 2x2 (4 rays per pixel) for anti-aliasing.
+    // ------------------------------------------------------------------
+    sampler_ptr = new Jittered(camera_ptr, &vplane, 2);
+
+
+    // ------------------------------------------------------------------
+    // Tracer — Shadow tracer so lights cast proper shadows.
+    // ------------------------------------------------------------------
+    tracer_ptr = new Shadow(this);
+
+
+    // ------------------------------------------------------------------
+    // Lights
+    //
+    //   1. Directional moon light: cold blue, high-left.
+    //   2. PointLight for each neon sign (warm tints).
+    // ------------------------------------------------------------------
+
+    // Moon: direction matches SceneLights::moon_center() minus origin.
+    // Direction vector points TOWARD the moon from the world origin.
+    DirectionalLight* moon_light = new DirectionalLight(
+        -86.0f, 112.0f, -198.0f,   // direction toward moon
+         0.46f,  0.58f,   0.84f,   // cold blue-white colour
+         1.2f                       // intensity
+    );
+    add_light(moon_light);
+
+    // Neon sign 1 — purple
+    PointLight* neon1 = new PointLight(
+        -92.0f, 34.0f, -118.0f,
+          0.95f, 0.22f,  1.07f,
+          6.0f
+    );
+    add_light(neon1);
+
+    // Neon sign 2 — cyan
+    PointLight* neon2 = new PointLight(
+        58.0f, 58.0f, -152.0f,
+        0.32f, 0.93f,  1.06f,
+        5.5f
+    );
+    add_light(neon2);
+
+    // Neon sign 3 — pink
+    PointLight* neon3 = new PointLight(
+        154.0f, 66.0f, -134.0f,
+          1.06f, 0.52f,  0.74f,
+          5.0f
+    );
+    add_light(neon3);
+
+    // Neon sign 4 — warm white
+    PointLight* neon4 = new PointLight(
+        -154.0f, 44.0f, -136.0f,
+           0.94f, 0.93f,  1.06f,
+           4.8f
+    );
+    add_light(neon4);
 
 
     // ==================================================================
-    // MOON
-    //   Must match SceneLights::moon_center() and MOON_SPHERE_RADIUS
-    //   exactly, so the lighting in all materials stays consistent.
+    // MOON SPHERE
     // ==================================================================
-    Point3D   moon_pos    = SceneLights::moon_center();
-    float     moon_radius = SceneLights::MOON_SPHERE_RADIUS;
+    Point3D moon_pos    = SceneLights::moon_center();
+    float   moon_radius = SceneLights::MOON_SPHERE_RADIUS;
 
     Sphere* moon = new Sphere(moon_pos, moon_radius);
     moon->set_material(new Emissive(0.8f, 0.87f, 1.06f, 2.62f));
@@ -185,8 +236,6 @@ void World::build(void)
 
     // ==================================================================
     // ROOFTOP DECK
-    //   A thin reflective slab representing the roof we are standing on.
-    //   Capped at z=9.92 so it never crosses the view plane at z=10.
     // ==================================================================
     Box* roof = new Box(
         Point3D(-34.0f, 40.35f, -52.0f),
@@ -195,32 +244,32 @@ void World::build(void)
     roof->set_material(new Reflective(0.07f, 0.074f, 0.084f, 0.52f, 1.94f));
     add_geometry(roof);
 
-    // -- Puddles on the deck ------------------------------------------
-    Sphere* puddle_a = new Sphere(Point3D(14.0f, 41.06f, -6.0f), 3.05f);
+    // Puddles on the deck.
+    Sphere* puddle_a = new Sphere(Point3D( 14.0f, 41.06f, -6.0f), 3.05f);
     puddle_a->set_material(new Reflective(0.04f, 0.049f, 0.058f, 0.74f, 2.08f));
     add_geometry(puddle_a);
 
-    Sphere* puddle_b = new Sphere(Point3D(-10.0f, 41.03f, 2.0f), 2.55f);
+    Sphere* puddle_b = new Sphere(Point3D(-10.0f, 41.03f,  2.0f), 2.55f);
     puddle_b->set_material(new Reflective(0.048f, 0.056f, 0.065f, 0.70f, 1.96f));
     add_geometry(puddle_b);
 
-    // -- West parapet wall --------------------------------------------
+    // West parapet wall.
     Box* parapet_west = new Box(
-        Point3D(-34.0f, 41.0f, -52.0f),
-        Point3D(-31.2f, 42.4f,   9.92f)
+        Point3D(-34.0f, 41.0f,  -52.0f),
+        Point3D(-31.2f, 42.4f,    9.92f)
     );
     parapet_west->set_material(new MoonLitWetConcrete(0.068f, 0.069f, 0.074f, 0.73f));
     add_geometry(parapet_west);
 
-    // -- East parapet wall --------------------------------------------
+    // East parapet wall.
     Box* parapet_east = new Box(
-        Point3D(55.0f, 41.0f, -52.0f),
-        Point3D(58.0f, 42.35f,  9.92f)
+        Point3D(55.0f, 41.0f,  -52.0f),
+        Point3D(58.0f, 42.35f,   9.92f)
     );
     parapet_east->set_material(new MoonLitWetConcrete(0.068f, 0.069f, 0.074f, 0.73f));
     add_geometry(parapet_east);
 
-    // -- HVAC unit A (large box near centre-right) --------------------
+    // HVAC unit A.
     Box* hvac_a = new Box(
         Point3D(  4.0f, 41.02f, -18.0f),
         Point3D( 22.0f, 43.95f,   2.0f)
@@ -228,7 +277,7 @@ void World::build(void)
     hvac_a->set_material(new MoonLitWetConcrete(0.060f, 0.063f, 0.069f, 0.71f));
     add_geometry(hvac_a);
 
-    // -- HVAC unit B (smaller box on the left) ------------------------
+    // HVAC unit B.
     Box* hvac_b = new Box(
         Point3D(-18.0f, 41.0f,  -32.0f),
         Point3D( -7.0f, 42.95f, -16.0f)
@@ -239,11 +288,7 @@ void World::build(void)
 
     // ==================================================================
     // STREET LEVEL
-    //   A large flat plane for the ground, plus four raised road slabs
-    //   sitting just above it to represent arterial streets.
     // ==================================================================
-
-    // -- Ground plane (wet asphalt basin) -----------------------------
     Plane* ground = new Plane(
         Point3D(0.0f, -54.5f, 0.0f),
         Vector3D(0.0f, 1.0f, 0.0f)
@@ -251,7 +296,6 @@ void World::build(void)
     ground->set_material(new StreetWetAsphalt(0.030f, 0.032f, 0.038f, 0.74f));
     add_geometry(ground);
 
-    // -- North-south artery near the base of our building -------------
     Box* road_ns_near = new Box(
         Point3D(-11.0f, -54.32f, -240.0f),
         Point3D( 11.0f, -53.90f,   28.0f)
@@ -259,7 +303,6 @@ void World::build(void)
     road_ns_near->set_material(new StreetWetAsphalt(0.029f, 0.032f, 0.042f, 0.76f));
     add_geometry(road_ns_near);
 
-    // -- North-south artery on the far right of frame -----------------
     Box* road_ns_far = new Box(
         Point3D(118.0f, -54.32f, -220.0f),
         Point3D(148.0f, -53.90f,   20.0f)
@@ -267,7 +310,6 @@ void World::build(void)
     road_ns_far->set_material(new StreetWetAsphalt(0.030f, 0.032f, 0.040f, 0.73f));
     add_geometry(road_ns_far);
 
-    // -- East-west artery cutting across the mid-ground ---------------
     Box* road_ew = new Box(
         Point3D(-240.0f, -54.34f, -138.0f),
         Point3D( 240.0f, -53.95f, -112.0f)
@@ -275,7 +317,6 @@ void World::build(void)
     road_ew->set_material(new StreetWetAsphalt(0.029f, 0.032f, 0.041f, 0.74f));
     add_geometry(road_ew);
 
-    // -- Wide boulevard loop in the foreground ------------------------
     Box* boulevard = new Box(
         Point3D(-120.0f, -54.37f, -58.0f),
         Point3D( 190.0f, -54.00f, -32.0f)
@@ -285,12 +326,8 @@ void World::build(void)
 
 
     // ==================================================================
-    // CITY TOWERS
-    //   Each tower gets: a concrete body, a glass curtain-wall strip on
-    //   its front face, and several rows of dark window recesses.
+    // HERO CITY TOWERS (8 major buildings in the foreground/mid-ground)
     // ==================================================================
-
-    // -- Tower 1: tall block far left ---------------------------------
     add_tower(this, -118.0f, -56.0f, -210.0f, -170.0f, -54.0f, 108.0f, 0.82f);
     add_glass_strip(this, -116.0f, -57.0f, -15.0f, 84.0f, -170.0f, 2.6f);
 
@@ -299,7 +336,6 @@ void World::build(void)
         add_window_band(this, -110.0f, -63.0f, win_y, win_y + 7.0f, -170.0f, 0.4f);
     }
 
-    // -- Tower 2: mid-left block --------------------------------------
     add_tower(this, -62.0f, 6.0f, -198.0f, -154.0f, -54.0f, 96.0f, 0.79f);
     add_glass_strip(this, -60.0f, 4.0f, -8.0f, 76.0f, -154.0f, 2.3f);
 
@@ -308,7 +344,6 @@ void World::build(void)
         add_window_band(this, -55.0f, 0.0f, win_y, win_y + 6.0f, -154.0f, 0.35f);
     }
 
-    // -- Tower 3: tallest block, right of centre ----------------------
     add_tower(this, 26.0f, 84.0f, -208.0f, -166.0f, -54.0f, 118.0f, 0.81f);
     add_glass_strip(this, 28.0f, 82.0f, 0.0f, 98.0f, -166.0f, 2.5f);
 
@@ -317,63 +352,151 @@ void World::build(void)
         add_window_band(this, 33.0f, 78.0f, win_y, win_y + 7.0f, -166.0f, 0.38f);
     }
 
-    // -- Tower 4: shorter block, left mid-ground (no windows) ---------
     add_tower(this, -92.0f, -18.0f, -130.0f, -94.0f, -54.0f, 72.0f, 0.76f);
     add_glass_strip(this, -90.0f, -20.0f, -20.0f, 56.0f, -94.0f, 1.95f);
 
-    // -- Tower 5: wide block far right --------------------------------
     add_tower(this, 94.0f, 168.0f, -182.0f, -158.0f, -54.0f, 104.0f, 0.80f);
     add_glass_strip(this, 96.0f, 165.0f, -6.0f, 90.0f, -158.0f, 2.55f);
 
-    // -- Tower 6: block far left background ---------------------------
     add_tower(this, -154.0f, -108.0f, -146.0f, -124.0f, -54.0f, 92.0f, 0.74f);
     add_glass_strip(this, -152.0f, -110.0f, -4.0f, 72.0f, -124.0f, 2.05f);
 
-    // -- Tower 7: far right background, no glass ----------------------
     add_tower(this, 136.0f, 192.0f, -140.0f, -118.0f, -54.0f, 78.0f, 0.73f);
-
-    // -- Tower 8: small block in the foreground mid-left --------------
-    add_tower(this, -36.0f, 24.0f, -122.0f, -98.0f, -54.0f, 62.0f, 0.71f);
+    add_tower(this, -36.0f,  24.0f, -122.0f,  -98.0f, -54.0f, 62.0f, 0.71f);
 
 
     // ==================================================================
-    // NEON SIGNS
-    //   Four coloured glow spheres sitting above rooftops in the skyline.
-    //   Colours: purple, cyan, pink, warm white.
+    // NEON GLOW SPHERES (4 signs above the skyline)
     // ==================================================================
-    add_neon(this,  -92.0f,  34.0f, -118.0f,  0.95f, 0.22f, 1.07f, 9.80f);  // purple
-    add_neon(this,   58.0f,  58.0f, -152.0f,  0.32f, 0.93f, 1.06f, 8.90f);  // cyan
-    add_neon(this,  154.0f,  66.0f, -134.0f,  1.06f, 0.52f, 0.74f, 8.35f);  // pink
-    add_neon(this, -154.0f,  44.0f, -136.0f,  0.94f, 0.93f, 1.06f, 7.85f);  // warm white
+    add_neon(this,  -92.0f,  34.0f, -118.0f,  0.95f, 0.22f, 1.07f, 9.80f);
+    add_neon(this,   58.0f,  58.0f, -152.0f,  0.32f, 0.93f, 1.06f, 8.90f);
+    add_neon(this,  154.0f,  66.0f, -134.0f,  1.06f, 0.52f, 0.74f, 8.35f);
+    add_neon(this, -154.0f,  44.0f, -136.0f,  0.94f, 0.93f, 1.06f, 7.85f);
 
 
     // ==================================================================
-    // RAIN VEIL
-    //   54 thin vertical streak boxes placed across the frame, between
-    //   the camera and the skyline. Each streak is offset slightly in X
-    //   and Z using sine/cosine so they feel random without using rand().
+    // BACKGROUND CITY SPRAWL
+    //
+    // A 300 x 300 grid of small city blocks fills the deep background
+    // from z = -220 to z = -800, x = -500 to x = 500.
+    // Each block gets a random height between 20 and 90 units.
+    // This contributes 90,000 primitives.
     // ==================================================================
-    int   rain_count = 54;
+    int   grid_cols  = 300;
+    int   grid_rows  = 300;
+    float grid_x_min = -500.0f;
+    float grid_x_max =  500.0f;
+    float grid_z_min = -800.0f;
+    float grid_z_max = -220.0f;
+
+    float cell_width = (grid_x_max - grid_x_min) / static_cast<float>(grid_cols);
+    float cell_depth = (grid_z_max - grid_z_min) / static_cast<float>(grid_rows);
+
+    // Use a fixed seed so the scene is deterministic.
+    srand(42);
+
+    for (int col = 0; col < grid_cols; col++)
+    {
+        for (int row = 0; row < grid_rows; row++)
+        {
+            // Cell bounds in X and Z.
+            float x0 = grid_x_min + col * cell_width + 1.0f;
+            float x1 = x0 + cell_width - 2.0f;
+            float z0 = grid_z_min + row * cell_depth + 1.0f;
+            float z1 = z0 + cell_depth - 2.0f;
+
+            // Random height between 20 and 90.
+            float height = 20.0f + static_cast<float>(rand() % 71);
+
+            // Random wetness between 0.5 and 0.9.
+            float wetness = 0.5f + static_cast<float>(rand() % 41) * 0.01f;
+
+            // Random albedo variation: dark grey to blue-grey.
+            float base_r = 0.04f + static_cast<float>(rand() % 30) * 0.001f;
+            float base_g = 0.045f + static_cast<float>(rand() % 30) * 0.001f;
+            float base_b = 0.06f + static_cast<float>(rand() % 40) * 0.001f;
+
+            Box* city_block = new Box(
+                Point3D(x0, -54.0f, z0),
+                Point3D(x1, -54.0f + height, z1)
+            );
+            city_block->set_material(
+                new MoonLitWetConcrete(base_r, base_g, base_b, wetness)
+            );
+
+            add_geometry(city_block);
+        }
+    }
+
+
+    // ==================================================================
+    // RAIN DROP SPHERES
+    //
+    // 900,000 tiny spheres scattered in the volume between the camera
+    // and the far background. Each is a small semi-transparent bead
+    // catching moonlight. Combined with the 90,000 city blocks and
+    // ~110 other objects this gives us well over 1,000,000 primitives.
+    //
+    // Volume: x in [-300, 300], y in [-50, 110], z in [-800, 9]
+    // Radius: 0.08 units (tiny, like a real raindrop)
+    // ==================================================================
+    int   rain_count = 900000;
+    float rain_x_min = -300.0f;
+    float rain_x_max =  300.0f;
+    float rain_y_min =  -50.0f;
+    float rain_y_max =  110.0f;
+    float rain_z_min = -800.0f;
+    float rain_z_max =    9.0f;
+
+    float rain_x_span = rain_x_max - rain_x_min;
+    float rain_y_span = rain_y_max - rain_y_min;
+    float rain_z_span = rain_z_max - rain_z_min;
 
     for (int i = 0; i < rain_count; i++)
     {
-        // t goes from 0.0 to 1.0 across all streaks
-        float t = static_cast<float>(i) / static_cast<float>(rain_count - 1);
+        // Random position within the rain volume.
+        float rx = rain_x_min + static_cast<float>(rand()) * invRAND_MAX * rain_x_span;
+        float ry = rain_y_min + static_cast<float>(rand()) * invRAND_MAX * rain_y_span;
+        float rz = rain_z_min + static_cast<float>(rand()) * invRAND_MAX * rain_z_span;
 
-        // X position: spread across the frame with a gentle sine wobble
-        float streak_x = -24.0f + 48.0f * t + std::sin(t * 6.283f * 5.17f) * 6.0f;
+        Sphere* raindrop = new Sphere(Point3D(rx, ry, rz), 0.08f);
+        raindrop->set_material(new RainStreakMat());
 
-        // Z position: streaks start near the camera and go deep into the scene
-        float streak_z = 6.0f - 210.0f * t;
+        add_geometry(raindrop);
+    }
 
-        // Y centre: floats up and down slightly along the veil
-        float streak_y = 46.0f + std::sin(t * 43.0f) * 14.0f;
 
-        // Height: varies slightly so not all streaks are identical
+    // ==================================================================
+    // FOREGROUND RAIN STREAKS (54 vertical boxes near the camera)
+    // ==================================================================
+    int rain_streak_count = 54;
+
+    for (int i = 0; i < rain_streak_count; i++)
+    {
+        float t = static_cast<float>(i) / static_cast<float>(rain_streak_count - 1);
+
+        float streak_x      = -24.0f + 48.0f * t + std::sin(t * 6.283f * 5.17f) * 6.0f;
+        float streak_z      = 6.0f - 210.0f * t;
+        float streak_y      = 46.0f + std::sin(t * 43.0f) * 14.0f;
         float streak_height = 16.0f + std::cos(t * 31.0f) * 4.0f;
 
         add_rain_streak(this, streak_x, streak_y, streak_z, streak_height);
     }
+
+
+    // ==================================================================
+    // BUILD THE BVH
+    //
+    // This must be called AFTER all geometry has been added.
+    // The BVH organises all 1M+ objects into a tree so ray intersection
+    // is O(log N) instead of O(N).
+    //
+    // To render WITHOUT the BVH (for comparison), comment out these
+    // two lines. See README for the -DUSE_ACCEL flag alternative.
+    // ==================================================================
+    BVH* bvh = new BVH();
+    bvh->build(geometry);
+    accel_ptr = bvh;
 }
 
 // for sara:
