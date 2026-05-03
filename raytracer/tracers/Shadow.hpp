@@ -62,14 +62,24 @@ public:
         V.normalize();
 
         // Loop over every light in the scene.
+        // Distance cull: skip PointLights further than 180 units — at that
+        // distance the 1/(1+0.01*d^2) falloff gives < 3% contribution.
+        // Tighter cull keeps distant buildings from being lit up by far
+        // window PointLights, preserving the dark blue-grey facade colour.
         for (int i = 0; i < (int)world_ptr->lights.size(); i++) {
+
+            // Get how far away this light is.
+            float light_distance = world_ptr->lights[i]->get_distance(sinfo);
+
+            // Skip lights that are too far to contribute meaningfully.
+            // kHugeValue means directional light — always include those.
+            if (light_distance < kHugeValue && light_distance > 180.0f) {
+                continue;
+            }
 
             // Get the direction from hit point toward this light.
             Vector3D L = world_ptr->lights[i]->get_direction(sinfo);
             L.normalize();
-
-            // Get how far away this light is.
-            float light_distance = world_ptr->lights[i]->get_distance(sinfo);
 
             // Build a shadow ray starting just above the surface.
             // We offset by kEpsilon along the normal to avoid self-intersection.
@@ -102,11 +112,15 @@ public:
             RGBColor light_radiance = world_ptr->lights[i]->get_radiance(sinfo);
 
             // Diffuse contribution.
-            RGBColor diffuse = light_radiance * static_cast<float>(n_dot_l) * 0.6f;
+            // Low diffuse weight so window PointLights only brighten their
+            // immediate surroundings; building facades stay dark blue-grey.
+            RGBColor diffuse = light_radiance * static_cast<float>(n_dot_l) * 0.10f;
 
-            // Specular contribution (shininess = 32 for a moderate gloss).
-            float specular_factor = static_cast<float>(std::pow(n_dot_h, 32.0));
-            RGBColor specular = light_radiance * specular_factor * 0.3f;
+            // Specular contribution.
+            // Higher shininess (64) = tighter highlights on wet surfaces.
+            // Higher specular weight (0.55) = visible glossy streaks on ground.
+            float specular_factor = static_cast<float>(std::pow(n_dot_h, 64.0));
+            RGBColor specular = light_radiance * specular_factor * 0.55f;
 
             // Add both contributions to the final color.
             color = color + diffuse + specular;

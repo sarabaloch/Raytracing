@@ -14,9 +14,9 @@
 
 namespace SceneLights {
 
-inline Point3D moon_center() { return Point3D(-86.f, 112.f, -198.f); }
+inline Point3D moon_center() { return Point3D(-40.f, 138.f, -350.f); }
 
-inline constexpr float MOON_SPHERE_RADIUS = 44.f;
+inline constexpr float MOON_SPHERE_RADIUS = 32.f;
 
 /** Unit vector from surface point toward the moon disc. */
 inline Vector3D moon_direction_toward(const Point3D &surf) {
@@ -28,7 +28,7 @@ inline Vector3D moon_direction_toward(const Point3D &surf) {
 /** Soft inverse-square style falloff so distant streets dim slightly vs. rooftops. */
 inline float moon_illum_scale(const Point3D &surf) {
     float dsq = surf.d_squared(moon_center());
-    return std::clamp(210000.f / std::max(dsq, 5200.f), 0.46f, 1.18f);
+    return std::clamp(380000.f / std::max(dsq, 5200.f), 0.55f, 1.55f);
 }
 
 inline Vector3D rain_skylight_up() {
@@ -37,9 +37,9 @@ inline Vector3D rain_skylight_up() {
     return L;
 }
 
-inline RGBColor moon_spectrum() { return RGBColor(0.46f, 0.58f, 0.84f); }
+inline RGBColor moon_spectrum() { return RGBColor(0.52f, 0.68f, 1.00f); }
 
-inline RGBColor night_ambient_cool() { return RGBColor(0.014f, 0.02f, 0.032f); }
+inline RGBColor night_ambient_cool() { return RGBColor(0.018f, 0.022f, 0.048f); }
 
 } // namespace SceneLights
 
