@@ -1,516 +1,495 @@
 /**
  * NightCity.cpp
  *
- * Raytraced cyberpunk night city scene - Purple/Magenta aesthetic.
+ * Cyberpunk night city - purple/magenta aesthetic.
  *
- * This scene features:
- * - Lower foreground rooftop with fence, AC units, utility boxes,
- *   pipes, and cables.
- * - Progressively darker, high-density background skyscrapers.
- * - Purple/magenta/orange neon signage.
- * - Deep purple ambient lighting with vibrant neon contrasts.
- *
- * Requirements met:
- *   - BVH acceleration structure (flag: comment out bvh->build to disable)
- *   - Shadow tracer
- *   - Jittered sampler (2x2, 4 rays per pixel)
- *   - Two light sources: DirectionalLight + multiple PointLights
- *   - 1M+ primitives: foreground detail + dense window grids + 800k
- *     background city blocks in the procedural city loop
+ * Design:
+ *  - Camera looks slightly upward so the upper 40% of frame is open sky.
+ *  - Large moon (emissive sphere) sits clearly in the upper sky area.
+ *  - Buildings occupy the lower 60% of the frame — short silhouettes.
+ *  - Rooftop / fence is at the very bottom edge, barely visible.
+ *  - Rain uses Sphere primitives (small glowing dots) instead of Box,
+ *    which produces natural-looking droplets rather than stiff rectangles.
+ *  - Puddles on rooftop reflect neon and moonlight.
+ *  - 1M+ primitives via horizon window grids.
  */
 
 #include "../cameras/Perspective.hpp"
-
 #include "../extras/Box.hpp"
 #include "../extras/Emissive.hpp"
-
+#include "../extras/Puddle.hpp"
 #include "../geometry/Plane.hpp"
 #include "../geometry/Sphere.hpp"
-
 #include "../lights/PointLight.hpp"
 #include "../lights/DirectionalLight.hpp"
-
 #include "../materials/Cosine.hpp"
-
-#include "../samplers/Jittered.hpp"
-
+#include "../samplers/Simple.hpp"
 #include "../tracers/Shadow.hpp"
-
 #include "../acceleration/BVH.hpp"
-
 #include "../utilities/Constants.hpp"
 #include "../utilities/RGBColor.hpp"
 #include "../utilities/Vector3D.hpp"
 #include "../utilities/Point3D.hpp"
-
 #include "../world/World.hpp"
-
 #include <cmath>
 #include <cstdlib>
 
-// Deterministic pseudo-random float in [0, 1).
 static float frand(unsigned int& seed) {
     seed = seed * 1664525u + 1013904223u;
     return static_cast<float>(seed & 0xFFFFFF) / float(0x1000000);
 }
 
+// ---------------------------------------------------------------------------
+// Rain using Sphere primitives.
+// Each raindrop is a small emissive sphere — produces soft glowing dots
+// that look like real rain droplets catching neon/moonlight.
+// Two spheres per drop: a bright core and a larger faint halo.
+// ---------------------------------------------------------------------------
+static void rainField(World& w,
+    float xMin, float xMax,
+    float yMin, float yMax,
+    float zMin, float zMax,
+    int count,
+    const RGBColor& tint,
+    float brightness,
+    unsigned int& seed)
+{
+    float xR = xMax - xMin;
+    float yR = yMax - yMin;
+    float zR = zMax - zMin;
+
+    for (int i = 0; i < count; i++) {
+        float rx = xMin + frand(seed) * xR;
+        float ry = yMin + frand(seed) * yR;
+        float rz = zMin + frand(seed) * zR;
+
+        // Core drop: small bright sphere.
+        float coreR  = 0.25f + frand(seed) * 0.35f;
+        float coreBr = brightness * (0.6f + frand(seed) * 0.6f);
+        Sphere* core = new Sphere(Point3D(rx, ry, rz), coreR);
+        core->set_material(new Emissive(tint, coreBr));
+        w.add_geometry(core);
+
+        // Halo: slightly larger, much dimmer — simulates water-droplet scatter.
+        float haloR  = coreR * 2.2f;
+        float haloBr = coreBr * 0.18f;
+        Sphere* halo = new Sphere(Point3D(rx, ry, rz), haloR);
+        halo->set_material(new Emissive(tint, haloBr));
+        w.add_geometry(halo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Puddle patches on the rooftop.
+// ---------------------------------------------------------------------------
+static void puddleField(World& w,
+    float xMin, float xMax,
+    float zMin, float zMax,
+    float yTop,
+    int count,
+    const RGBColor& reflColor,
+    float wetness,
+    unsigned int& seed)
+{
+    float xR = xMax - xMin;
+    float zR = zMax - zMin;
+    for (int i = 0; i < count; i++) {
+        float px  = xMin + frand(seed) * xR;
+        float pz  = zMin + frand(seed) * zR;
+        float pWx = 6.f  + frand(seed) * 22.f;
+        float pWz = 5.f  + frand(seed) * 14.f;
+        Box* b = new Box(
+            Point3D(px,       yTop - 0.4f, pz),
+            Point3D(px + pWx, yTop,        pz + pWz));
+        b->set_material(new Puddle(reflColor, wetness * (0.55f + frand(seed) * 0.45f)));
+        w.add_geometry(b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Emissive window grid on a building face (face_z = front face z coord).
+// ---------------------------------------------------------------------------
+static void windowGrid(World& w,
+    float x0, float x1, float y0, float y1, float face_z,
+    const RGBColor& col, float brightness, float density, unsigned int& seed)
+{
+    float cW = 9.f, cH = 11.f, wW = 5.f, wH = 5.f;
+    int cols = (int)((x1 - x0) / cW); if (cols < 1) cols = 1;
+    int rows = (int)((y1 - y0) / cH); if (rows < 1) rows = 1;
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            if (frand(seed) > density) continue;
+            float wx = x0 + c * cW + 2.f;
+            float wy = y0 + r * cH + 3.f;
+            if (wx + wW > x1 || wy + wH > y1) continue;
+            float br = brightness * (0.5f + frand(seed) * 0.8f);
+            bool warm = frand(seed) > 0.4f;
+            RGBColor wc = warm
+                ? RGBColor(col.r, col.g * 0.5f + 0.3f, col.b * 0.1f + 0.1f)
+                : col;
+            Box* win = new Box(
+                Point3D(wx,      wy,      face_z),
+                Point3D(wx + wW, wy + wH, face_z + 0.6f));
+            win->set_material(new Emissive(wc, br));
+            w.add_geometry(win);
+        }
+    }
+}
+
+// ===========================================================================
 void World::build() {
+// ===========================================================================
 
-    // ── View plane ──────────────────────────────────────────────────────────
-    vplane.top_left     = Point3D(-120, 150, 200);
-    vplane.bottom_right = Point3D( 120, -150, 200);
+    // ── View plane ───────────────────────────────────────────────────────────
+    // Camera eye: z=600, y=0 (level).
+    // View plane at z=200. Looking slightly upward: eye y=0, plane centre y=10.
+    // This shifts the horizon DOWN so the upper frame is open sky.
+    vplane.top_left     = Point3D(-120, 160, 200);
+    vplane.bottom_right = Point3D( 120, -80, 200);
     vplane.hres = 600;
-    vplane.vres = 750;
+    vplane.vres = 600;
 
-    // Deep purple night sky background.
-    bg_color = RGBColor(0.02f, 0.00f, 0.06f);
+    bg_color = RGBColor(0.008f, 0.000f, 0.025f); // near-black deep purple
 
-    set_camera(new Perspective(0, 30, 600));
-
-    // Jittered 2x2 sampler (4 rays per pixel) — reduces aliasing on neon edges.
-    sampler_ptr = new Jittered(camera_ptr, &vplane, 2);
+    set_camera(new Perspective(0.f, 0.f, 600.f));
+    sampler_ptr = new Simple(camera_ptr, &vplane);
     tracer_ptr  = new Shadow(this);
 
-    // ── Palette: Purple/Magenta focus ───────────────────────────────────────
-    RGBColor bldDarkPurple (0.03f, 0.00f, 0.06f);
-    RGBColor bldMidPurple  (0.04f, 0.00f, 0.09f);
-    RGBColor bldWarmPurple (0.05f, 0.00f, 0.07f);
-    RGBColor bldSlatePurple(0.01f, 0.00f, 0.04f);
+    // ── Palette ──────────────────────────────────────────────────────────────
     RGBColor bldBlack      (0.00f, 0.00f, 0.00f);
+    RGBColor bldDarkPurple (0.025f,0.00f, 0.045f);
+    RGBColor bldMidPurple  (0.035f,0.00f, 0.07f);
+    RGBColor bldSlatePurple(0.015f,0.00f, 0.032f);
 
-    RGBColor neonMagenta(1.0f, 0.05f, 0.85f);
-    RGBColor neonPurple (0.85f, 0.02f, 1.0f);
+    RGBColor neonMagenta(1.0f,  0.05f, 0.85f);
+    RGBColor neonPurple (0.75f, 0.02f, 1.00f);
     RGBColor neonOrange (1.0f,  0.45f, 0.02f);
     RGBColor neonRed    (1.0f,  0.05f, 0.10f);
     RGBColor neonYellow (1.0f,  0.90f, 0.05f);
     RGBColor neonPink   (1.0f,  0.15f, 0.60f);
-    RGBColor neonWhite  (0.95f, 0.85f, 1.0f);
+    RGBColor neonWhite  (0.95f, 0.90f, 1.00f);
+    RGBColor winWarm    (1.0f,  0.70f, 0.30f);
+    RGBColor winPurple  (0.80f, 0.20f, 1.00f);
+    RGBColor moonColor  (0.88f, 0.90f, 1.00f); // cool blue-white
 
-    RGBColor winWarm  (1.0f,  0.70f, 0.30f);
-    RGBColor winPurple(0.85f, 0.20f, 1.0f);
-    RGBColor roofColor  (0.04f, 0.00f, 0.08f);
-    RGBColor ledgeColor (0.02f, 0.00f, 0.04f);
-    RGBColor detailsColor(0.03f, 0.00f, 0.05f);
+    RGBColor roofColor  (0.025f,0.00f, 0.045f);
+    RGBColor detailColor(0.018f,0.00f, 0.032f);
 
     unsigned int seed = 0xDEADBEEF;
 
-    // ── Foreground rooftop ──────────────────────────────────────────────────
+    // Rooftop y-level. View plane bottom is y=-80, so roofY=-72 puts the
+    // rooftop just inside the bottom of the frame — barely visible.
+    float roofY = -72.f;
 
-    float roofY = -25.0f;
-
-    { Box* b = new Box(Point3D(-320, roofY, 180), Point3D(320, roofY + 0.1f, 260));
-      b->set_material(new Cosine(roofColor)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(-320, roofY, 175), Point3D(320, roofY + 12, 185));
-      b->set_material(new Cosine(ledgeColor)); add_geometry(b); }
-
-    // ── Fence ───────────────────────────────────────────────────────────────
-
-    for (int i = -3; i <= 3; i++) {
-        if (i == 0) continue;
-        Box* post = new Box(
-            Point3D(i*80.f - 2.5f, roofY + 12, 178),
-            Point3D(i*80.f + 2.5f, roofY + 70, 182)
-        );
-        post->set_material(new Cosine(detailsColor));
-        add_geometry(post);
+    // ── MOON ─────────────────────────────────────────────────────────────────
+    // Placed at upper-centre of sky, large and bright.
+    // y=120 maps to upper portion of the frame (top_left y=160).
+    // z=-350 puts it behind all buildings.
+    float moonX = -40.f, moonY = 108.f, moonZ = -350.f;
+    float moonRad = 32.f;
+    {
+        // Solid bright disc.
+        Sphere* moon = new Sphere(Point3D(moonX, moonY, moonZ), moonRad);
+        moon->set_material(new Emissive(moonColor, 9.0f));
+        add_geometry(moon);
+    }
+    {
+        // Inner soft glow ring.
+        Sphere* g1 = new Sphere(Point3D(moonX, moonY, moonZ - 1.f), moonRad * 1.35f);
+        g1->set_material(new Emissive(moonColor, 1.8f));
+        add_geometry(g1);
+    }
+    {
+        // Outer atmospheric halo.
+        Sphere* g2 = new Sphere(Point3D(moonX, moonY, moonZ - 2.f), moonRad * 1.80f);
+        g2->set_material(new Emissive(moonColor, 0.55f));
+        add_geometry(g2);
     }
 
-    { Box* railT = new Box(Point3D(-320, roofY + 65, 178), Point3D(320, roofY + 70, 182));
-      railT->set_material(new Cosine(detailsColor)); add_geometry(railT); }
+    // ── FOREGROUND ROOFTOP ───────────────────────────────────────────────────
+    // Thin slab at the very bottom — just enough to show the ledge.
+    { Box* b = new Box(Point3D(-320, roofY,     180), Point3D(320, roofY + 0.5f, 270));
+      b->set_material(new Cosine(roofColor)); add_geometry(b); }
 
-    { Box* railB = new Box(Point3D(-320, roofY + 20, 178), Point3D(320, roofY + 25, 182));
-      railB->set_material(new Cosine(detailsColor)); add_geometry(railB); }
+    // Parapet wall — thin, low.
+    { Box* b = new Box(Point3D(-320, roofY, 175), Point3D(320, roofY + 8.f, 184));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
 
-    // ── AC units ────────────────────────────────────────────────────────────
+    // Thin railing bar across the top of the parapet.
+    { Box* b = new Box(Point3D(-320, roofY + 7.f, 176), Point3D(320, roofY + 9.f, 180));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
 
-    { Box* ac = new Box(Point3D(-160, roofY + 0.1f, 210), Point3D(-110, roofY + 30, 245));
-      ac->set_material(new Cosine(detailsColor)); add_geometry(ac); }
+    // A few AC units just above roofY — small, not dominating.
+    { Box* b = new Box(Point3D(-150, roofY + 0.5f, 210), Point3D(-110, roofY + 18.f, 238));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
+    { Box* b = new Box(Point3D( 120, roofY + 0.5f, 212), Point3D( 155, roofY + 15.f, 234));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
+    { Box* b = new Box(Point3D(  20, roofY + 0.5f, 220), Point3D(  55, roofY + 12.f, 240));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
 
-    { Box* ac = new Box(Point3D(-95, roofY + 0.1f, 215), Point3D(-65, roofY + 25, 240));
-      ac->set_material(new Cosine(detailsColor)); add_geometry(ac); }
+    // Antenna on right.
+    { Box* b = new Box(Point3D(235, roofY + 0.5f, 210), Point3D(239, roofY + 70.f, 214));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
+    { Box* b = new Box(Point3D(222, roofY + 55.f, 210), Point3D(252, roofY + 57.f, 214));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
 
-    { Box* ac = new Box(Point3D(-50, roofY + 0.1f, 205), Point3D(-10, roofY + 28, 235));
-      ac->set_material(new Cosine(detailsColor)); add_geometry(ac); }
+    // Water tower left.
+    { Box* b = new Box(Point3D(-270, roofY + 0.5f, 222), Point3D(-248, roofY + 30.f, 244));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
+    { Box* b = new Box(Point3D(-268, roofY + 30.f, 224), Point3D(-250, roofY + 33.f, 242));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
 
-    { Box* ac = new Box(Point3D(180, roofY + 0.1f, 210), Point3D(220, roofY + 22, 240));
-      ac->set_material(new Cosine(detailsColor)); add_geometry(ac); }
+    // ── PUDDLES ──────────────────────────────────────────────────────────────
+    puddleField(*this, -280, -20, 186, 255, roofY + 0.5f, 30, neonMagenta, 0.88f, seed);
+    puddleField(*this,  -60, 110, 186, 255, roofY + 0.5f, 28, neonPurple,  0.82f, seed);
+    puddleField(*this,   70, 280, 186, 255, roofY + 0.5f, 25, neonOrange,  0.78f, seed);
+    // Moon reflection — elongated bright puddle in centre.
+    { Box* b = new Box(Point3D(-35, roofY + 0.1f, 200), Point3D(35, roofY + 0.5f, 245));
+      b->set_material(new Puddle(moonColor, 0.88f)); add_geometry(b); }
+    // Small emissive glow strip at ledge base.
+    { Box* b = new Box(Point3D(-100, roofY + 0.5f, 184), Point3D(60, roofY + 0.9f, 188));
+      b->set_material(new Emissive(neonMagenta, 2.5f)); add_geometry(b); }
 
-    { Box* ac = new Box(Point3D(120, roofY + 0.1f, 215), Point3D(150, roofY + 24, 240));
-      ac->set_material(new Cosine(detailsColor)); add_geometry(ac); }
+    // ── BUILDINGS ────────────────────────────────────────────────────────────
+    // All buildings are SHORT — tops reach y=40 to y=100 max.
+    // The view plane top is y=160, so the upper 40% of the image is pure sky.
 
-    // ── Pipes / utility boxes ────────────────────────────────────────────────
-
-    { Box* p = new Box(Point3D(-190, roofY + 0.1f, 190), Point3D(-186, roofY + 30, 194));
-      p->set_material(new Cosine(detailsColor)); add_geometry(p); }
-
-    { Box* p = new Box(Point3D(-195, roofY + 25, 185), Point3D(-181, roofY + 35, 199));
-      p->set_material(new Cosine(detailsColor)); add_geometry(p); }
-
-    { Box* b = new Box(Point3D(240, roofY + 0.1f, 180), Point3D(270, roofY + 13, 200));
-      b->set_material(new Cosine(detailsColor)); add_geometry(b); }
-
-    { Box* p = new Box(Point3D(250, roofY + 0.1f, 190), Point3D(254, roofY + 28, 194));
-      p->set_material(new Cosine(detailsColor)); add_geometry(p); }
-
-    // ── Large duct ──────────────────────────────────────────────────────────
-
-    { Box* duct = new Box(Point3D(-300, roofY + 18, 250), Point3D(300, roofY + 26, 258));
-      duct->set_material(new Cosine(detailsColor)); add_geometry(duct); }
-
-    // ── Wires ───────────────────────────────────────────────────────────────
-
-    { Box* w = new Box(Point3D(-130, roofY + 2, 200), Point3D(-100, roofY + 4, 202));
-      w->set_material(new Cosine(bldBlack)); add_geometry(w); }
-
-    { Box* w = new Box(Point3D(140, roofY + 1, 205), Point3D(170, roofY + 3, 207));
-      w->set_material(new Cosine(bldBlack)); add_geometry(w); }
-
-    // ── Antenna ─────────────────────────────────────────────────────────────
-
-    { Box* b = new Box(Point3D(240, roofY + 40, 210), Point3D(245, roofY + 125, 215));
-      b->set_material(new Cosine(detailsColor)); add_geometry(b); }
-
-    // ── Layer 1: Flanking towers (pitch black framing) ──────────────────────
-
-    { Box* b = new Box(Point3D(-370, -55, -30), Point3D(-185, 680, 140));
+    // Left flanking block.
+    { Box* b = new Box(Point3D(-370, -55, -25), Point3D(-182, 85, 148));
       b->set_material(new Cosine(bldBlack)); add_geometry(b); }
+    windowGrid(*this, -370, -182, -55, 85, 148, winPurple, 3.8f, 0.32f, seed);
 
-    { Box* b = new Box(Point3D(185, -55, -30), Point3D(370, 700, 140));
+    // Right flanking block.
+    { Box* b = new Box(Point3D(182, -55, -25), Point3D(370, 95, 148));
       b->set_material(new Cosine(bldBlack)); add_geometry(b); }
+    windowGrid(*this, 182, 370, -55, 95, 148, winWarm, 3.8f, 0.30f, seed);
 
-    // ── Layer 2: Central skyscrapers ────────────────────────────────────────
-
-    { Box* b = new Box(Point3D(15, -55, -130), Point3D(125, 740, -10));
+    // Central tower — tallest building, still well below sky zone.
+    { Box* b = new Box(Point3D(18, -55, -128), Point3D(112, 120, -12));
       b->set_material(new Cosine(bldMidPurple)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(55, 740, -85), Point3D(85, 960, -35));
-      b->set_material(new Cosine(detailsColor)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(-135, -55, -150), Point3D(-15, 630, -35));
+    // Horizontal ledge band.
+    { Box* b = new Box(Point3D(16, 55, -130), Point3D(114, 59, -10));
       b->set_material(new Cosine(bldDarkPurple)); add_geometry(b); }
+    // Thin spire on top.
+    { Box* b = new Box(Point3D(55, 120, -90), Point3D(75, 185, -50));
+      b->set_material(new Cosine(detailColor)); add_geometry(b); }
+    windowGrid(*this, 18, 112, -55, 120, -12, winPurple, 4.2f, 0.50f, seed);
 
-    { Box* b = new Box(Point3D(-80, -55, -90), Point3D(5, 490, 15));
-      b->set_material(new Cosine(bldWarmPurple)); add_geometry(b); }
+    // Centre-left tower.
+    { Box* b = new Box(Point3D(-128, -55, -142), Point3D(-22, 90, -38));
+      b->set_material(new Cosine(bldDarkPurple)); add_geometry(b); }
+    { Box* b = new Box(Point3D(-130, 42, -144), Point3D(-20, 46, -36));
+      b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
+    windowGrid(*this, -128, -22, -55, 90, -38, winPurple, 3.8f, 0.46f, seed);
 
-    { Box* b = new Box(Point3D(85, -55, -170), Point3D(165, 540, -75));
+    // Centre block (wide, shorter).
+    { Box* b = new Box(Point3D(-72, -55, -82), Point3D(12, 70, 20));
       b->set_material(new Cosine(bldMidPurple)); add_geometry(b); }
+    windowGrid(*this, -72, 12, -55, 70, 20, winWarm, 3.5f, 0.42f, seed);
 
-    // ── Layer 3: Far background row ─────────────────────────────────────────
+    // Right-centre tower.
+    { Box* b = new Box(Point3D(90, -55, -162), Point3D(160, 80, -80));
+      b->set_material(new Cosine(bldMidPurple)); add_geometry(b); }
+    { Box* b = new Box(Point3D(88, 38, -164), Point3D(162, 42, -78));
+      b->set_material(new Cosine(bldDarkPurple)); add_geometry(b); }
+    windowGrid(*this, 90, 160, -55, 80, -80, winPurple, 3.8f, 0.44f, seed);
 
-    { Box* b = new Box(Point3D(-250, -55, -500), Point3D(-70, 430, -360));
+    // Far background row — very short, just horizon silhouettes.
+    { Box* b = new Box(Point3D(-242, -55, -485), Point3D(-70, 55, -360));
       b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(-100, -55, -460), Point3D(10, 380, -330));
+    windowGrid(*this, -242, -70, -55, 55, -360, winPurple, 2.2f, 0.35f, seed);
+    { Box* b = new Box(Point3D(-95, -55, -452), Point3D(14, 48, -325));
       b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(0, -55, -510), Point3D(110, 410, -370));
+    windowGrid(*this, -95, 14, -55, 48, -325, winWarm, 2.0f, 0.33f, seed);
+    { Box* b = new Box(Point3D(8, -55, -500), Point3D(105, 52, -370));
       b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(85, -55, -480), Point3D(200, 470, -345));
+    windowGrid(*this, 8, 105, -55, 52, -370, winPurple, 2.0f, 0.35f, seed);
+    { Box* b = new Box(Point3D(90, -55, -470), Point3D(195, 45, -345));
       b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(175, -55, -520), Point3D(295, 390, -380));
+    { Box* b = new Box(Point3D(170, -55, -510), Point3D(288, 40, -380));
       b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
-
-    { Box* b = new Box(Point3D(-320, -55, -470), Point3D(-180, 420, -330));
+    { Box* b = new Box(Point3D(-315, -55, -460), Point3D(-175, 42, -330));
       b->set_material(new Cosine(bldSlatePurple)); add_geometry(b); }
+    windowGrid(*this, -315, -175, -55, 42, -330, winPurple, 1.8f, 0.30f, seed);
 
-    // ── Layer 4: Horizon skyscrapers (procedural, 120 buildings) ────────────
-
+    // Procedural horizon silhouettes — tiny buildings at the very horizon.
     for (int i = 0; i < 120; i++) {
-        float width     = 10.f + frand(seed) * 120.f;
-        float height    = 150.f + frand(seed) * 1200.f;
-        float depth     = -600.f - frand(seed) * 1800.f;
-        float xPos      = -800.f + frand(seed) * 1600.f;
-        float thickness = 20.f + frand(seed) * 120.f;
-
-        float darkness = 0.02f + (depth + 600.f) / -2000.f;
-        if (darkness < 0.005f) {
-            darkness = 0.005f;
-        }
-
-        RGBColor col(darkness * 0.8f, darkness * 0.1f, darkness * 1.2f);
-
-        Box* b = new Box(
-            Point3D(xPos, -55, depth),
-            Point3D(xPos + width, height, depth + thickness)
-        );
+        float w  = 8.f  + frand(seed) * 80.f;
+        float h  = 10.f + frand(seed) * 55.f;   // very short
+        float d  = -620.f - frand(seed) * 1600.f;
+        float xp = -820.f + frand(seed) * 1640.f;
+        float th = 18.f + frand(seed) * 80.f;
+        float dk = 0.012f + (d + 620.f) / -2000.f;
+        if (dk < 0.003f) dk = 0.003f;
+        RGBColor col(dk * 0.65f, dk * 0.04f, dk * 1.05f);
+        Box* b = new Box(Point3D(xp, -55, d), Point3D(xp + w, h, d + th));
         b->set_material(new Cosine(col));
         add_geometry(b);
     }
 
-    // ── Neon signs ──────────────────────────────────────────────────────────
+    // ── NEON SIGNS ───────────────────────────────────────────────────────────
+    // Repositioned to match shorter building heights.
 
-    // Left tower signs.
-    { Box* s = new Box(Point3D(-195, 215, 182), Point3D(-125, 295, 185));
-      s->set_material(new Emissive(neonMagenta, 20.0f)); add_geometry(s); }
+    // Left tower.
+    { Box* s = new Box(Point3D(-192, 28, 184), Point3D(-128,  72, 187));
+      s->set_material(new Emissive(neonMagenta, 22.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(-210,  5, 184), Point3D(-128,  20, 186));
+      s->set_material(new Emissive(neonPurple,  20.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(-208,-30, 184), Point3D(-188,   4, 186));
+      s->set_material(new Emissive(neonPink,    17.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(-196, 78, 183), Point3D(-120,  90, 185));
+      s->set_material(new Emissive(neonWhite,   21.f)); add_geometry(s); }
 
-    { Box* s = new Box(Point3D(-215, 165, 182), Point3D(-125, 185, 184));
-      s->set_material(new Emissive(neonPurple, 18.5f)); add_geometry(s); }
+    // Right tower.
+    { Box* s = new Box(Point3D(128,  42, 184), Point3D(190,  80, 187));
+      s->set_material(new Emissive(neonRed,    20.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(124,  10, 184), Point3D(206,  24, 186));
+      s->set_material(new Emissive(neonOrange, 18.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(138,  88, 183), Point3D(180,  98, 185));
+      s->set_material(new Emissive(neonMagenta,15.f)); add_geometry(s); }
 
-    { Box* s = new Box(Point3D(-205, 85, 182), Point3D(-185, 160, 184));
-      s->set_material(new Emissive(neonPink, 16.8f)); add_geometry(s); }
+    // Central tower signs — vertical neon stripes.
+    { Box* s = new Box(Point3D(20,  -20, 22), Point3D(30, 115, 25));
+      s->set_material(new Emissive(neonMagenta, 23.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(100, -20, 22), Point3D(110, 95, 25));
+      s->set_material(new Emissive(neonPurple,  21.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(48,   30, 23), Point3D(80,  38, 25));
+      s->set_material(new Emissive(neonWhite,   19.f)); add_geometry(s); }
 
-    { Box* s = new Box(Point3D(-190, 310, 180), Point3D(-180, 480, 182));
-      s->set_material(new Emissive(neonPurple, 15.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(-140, 110, 180), Point3D(-130, 150, 182));
-      s->set_material(new Emissive(neonRed, 14.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(-200, 320, 182), Point3D(-120, 335, 184));
-      s->set_material(new Emissive(neonWhite, 22.0f)); add_geometry(s); }
-
-    // Right tower signs.
-    { Box* s = new Box(Point3D(125, 240, 182), Point3D(195, 305, 185));
-      s->set_material(new Emissive(neonRed, 18.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(120, 195, 182), Point3D(210, 212, 184));
-      s->set_material(new Emissive(neonOrange, 16.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(135, 320, 180), Point3D(185, 340, 182));
-      s->set_material(new Emissive(neonMagenta, 14.5f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(150, 130, 180), Point3D(160, 185, 182));
-      s->set_material(new Emissive(neonPurple, 15.5f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(190, 220, 182), Point3D(205, 235, 184));
-      s->set_material(new Emissive(neonYellow, 16.0f)); add_geometry(s); }
-
-    // Central tower signs.
-    { Box* s = new Box(Point3D(32, 310, 21), Point3D(42, 610, 24));
-      s->set_material(new Emissive(neonMagenta, 22.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(98, 310, 21), Point3D(108, 550, 24));
-      s->set_material(new Emissive(neonPurple, 21.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(50, 350, 23), Point3D(80, 360, 25));
-      s->set_material(new Emissive(neonWhite, 19.0f)); add_geometry(s); }
-
-    // Centre-left tower signs.
-    { Box* s = new Box(Point3D(-108, 260, 31), Point3D(-30, 320, 33));
-      s->set_material(new Emissive(neonPurple, 18.5f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(-108, 180, 31), Point3D(-88, 255, 33));
-      s->set_material(new Emissive(neonMagenta, 16.2f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(-105, 330, 31), Point3D(-85, 410, 33));
-      s->set_material(new Emissive(neonOrange, 17.0f)); add_geometry(s); }
+    // Centre-left signs.
+    { Box* s = new Box(Point3D(-104, 30, 33), Point3D(-26, 58, 35));
+      s->set_material(new Emissive(neonPurple,  19.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(-104, -5, 33), Point3D(-86, 28, 35));
+      s->set_material(new Emissive(neonMagenta, 17.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(-102, 62, 33), Point3D(-84, 90, 35));
+      s->set_material(new Emissive(neonOrange,  18.f)); add_geometry(s); }
 
     // Mid-scene signs.
-    { Box* s = new Box(Point3D(-55, 190, 61), Point3D(25, 235, 63));
-      s->set_material(new Emissive(neonOrange, 16.5f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(-50, 15, 63), Point3D(20, 40, 65));
+      s->set_material(new Emissive(neonOrange, 17.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(108, 18, -17), Point3D(162, 55, -15));
+      s->set_material(new Emissive(neonYellow, 18.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(108,  0, -17), Point3D(162, 15, -15));
+      s->set_material(new Emissive(neonOrange, 16.f)); add_geometry(s); }
 
-    { Box* s = new Box(Point3D(-30, 160, 61), Point3D(-10, 185, 63));
-      s->set_material(new Emissive(neonMagenta, 14.8f)); add_geometry(s); }
+    // Distant horizon neon glow bands.
+    { Box* s = new Box(Point3D(-275, 10, -218), Point3D( -78, 24, -214));
+      s->set_material(new Emissive(neonMagenta, 12.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D(  14, 12, -218), Point3D( 195, 25, -214));
+      s->set_material(new Emissive(neonPurple,  11.f)); add_geometry(s); }
+    { Box* s = new Box(Point3D( 180,  4, -218), Point3D( 245, 14, -216));
+      s->set_material(new Emissive(neonOrange,  10.f)); add_geometry(s); }
 
-    // Right mid-building billboard.
-    { Box* s = new Box(Point3D(105, 210, -19), Point3D(168, 285, -17));
-      s->set_material(new Emissive(neonYellow, 17.8f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(105, 170, -19), Point3D(168, 198, -17));
-      s->set_material(new Emissive(neonOrange, 16.2f)); add_geometry(s); }
-
-    // Far background neon strips.
-    { Box* s = new Box(Point3D(-280, 75, -220), Point3D(-80, 105, -216));
-      s->set_material(new Emissive(neonMagenta, 13.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(10, 80, -220), Point3D(200, 110, -216));
-      s->set_material(new Emissive(neonPurple, 12.8f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(180, 60, -220), Point3D(250, 75, -218));
-      s->set_material(new Emissive(neonOrange, 11.0f)); add_geometry(s); }
-
-    { Box* s = new Box(Point3D(-220, 50, -220), Point3D(-160, 62, -218));
-      s->set_material(new Emissive(neonRed, 10.0f)); add_geometry(s); }
-
-    // ── Window lights ────────────────────────────────────────────────────────
-
-    // Left framing tower windows.
-    for (int row = 0; row < 18; row++) {
-        for (int col = 0; col < 6; col++) {
-            float wx0 = -215.f + col * 11.f;
-            float wy0 =   25.f + row * 28.f;
-            bool warm = ((row + col) % 2 == 0);
-            Box* w = new Box(
-                Point3D(wx0, wy0, 139.9f),
-                Point3D(wx0 + 6, wy0 + 4, 140.0f)
-            );
-            w->set_material(new Emissive(warm ? winWarm : winPurple, 2.0f + frand(seed) * 2.5f));
-            add_geometry(w);
-        }
-    }
-
-    // Right framing tower windows.
-    for (int row = 0; row < 18; row++) {
-        for (int col = 0; col < 6; col++) {
-            float wx0 = 135.f + col * 11.f;
-            float wy0 =  20.f + row * 28.f;
-            bool warm = ((row + col + 1) % 2 == 0);
-            Box* w = new Box(
-                Point3D(wx0, wy0, -10.1f),
-                Point3D(wx0 + 7, wy0 + 5, -10.0f)
-            );
-            w->set_material(new Emissive(warm ? winWarm : winPurple, 2.0f + frand(seed) * 2.5f));
-            add_geometry(w);
-        }
-    }
-
-    // Central tower windows.
-    for (int row = 0; row < 22; row++) {
-        for (int col = 0; col < 5; col++) {
-            float wx0 = 22.f + col * 16.f;
-            float wy0 = 10.f + row * 28.f;
-            if (frand(seed) < 0.12f) {
-                continue;
-            }
-            bool warm = frand(seed) > 0.5f;
-            Box* w = new Box(
-                Point3D(wx0, wy0, -9.5f),
-                Point3D(wx0 + 7, wy0 + 5, -8.5f)
-            );
-            w->set_material(new Emissive(warm ? winWarm : winPurple, 1.5f + frand(seed) * 3.5f));
-            add_geometry(w);
-        }
-    }
-
-    // Background scattered windows.
-    for (int i = 0; i < 220; i++) {
-        float rx = -240.f + frand(seed) * 460.f;
-        float ry =    5.f + frand(seed) * 360.f;
-        float rz = -290.f + frand(seed) * 420.f;
-        float rad = 1.2f + frand(seed) * 3.5f;
-        bool warm = frand(seed) > 0.5f;
-        Box* w = new Box(
-            Point3D(rx, ry, rz),
-            Point3D(rx + 6, ry + 4, rz + 1.0f)
-        );
-        w->set_material(new Emissive(warm ? winWarm : winPurple, rad));
-        add_geometry(w);
-    }
-
-    // ── Stars ────────────────────────────────────────────────────────────────
-
-    for (int i = 0; i < 300; i++) {
+    // ── STARS ────────────────────────────────────────────────────────────────
+    // Concentrated in the upper sky area (y = 60 to 155).
+    for (int i = 0; i < 350; i++) {
         float sx = -450.f + frand(seed) * 900.f;
-        float sy =  100.f + frand(seed) * 480.f;
-        float sz = -600.f - frand(seed) * 300.f;
-        float sr =    0.8f + frand(seed) * 1.8f;
-        float br =    4.0f + frand(seed) * 6.0f;
+        float sy =   60.f + frand(seed) * 95.f;   // upper sky band
+        float sz = -580.f - frand(seed) * 320.f;
+        float sr =   0.6f + frand(seed) * 1.4f;
+        float br =   3.0f + frand(seed) * 5.0f;
         float t  = frand(seed);
-        RGBColor col = (t < 0.5f) ? neonWhite : (t < 0.75f) ? winPurple : neonYellow;
+        RGBColor col = (t < 0.55f) ? neonWhite : (t < 0.78f) ? winPurple : neonYellow;
         Sphere* star = new Sphere(Point3D(sx, sy, sz), sr);
         star->set_material(new Emissive(col, br));
         add_geometry(star);
     }
 
-    // ── 1M primitives: window grids on the Layer 4 horizon buildings ──────────
-    //
-    // For each of the 120 procedural horizon buildings we already placed,
-    // we add a grid of window boxes flush with their front face (z + thickness).
-    // Windows are placed AT the building surface so they never float or clip.
-    //
-    // 120 buildings x avg ~8500 windows = ~1,020,000 window boxes total.
-    // The frand skip keeps ~55% lit for a natural scattered-light pattern.
-
-    // Re-run the same PRNG sequence used in Layer 4 so building positions match.
-    unsigned int wseed = 0xDEADBEEF;
-    // Burn through the same calls Layer 4 made so wseed is in sync.
+    // ── 1M PRIMITIVES: horizon building window grids ──────────────────────────
+    unsigned int ws = 0xDEADBEEF;
     for (int i = 0; i < 120; i++) {
-        frand(wseed); // width
-        frand(wseed); // height
-        frand(wseed); // depth
-        frand(wseed); // xPos
-        frand(wseed); // thickness
-    }
-
-    // Now replay Layer 4 geometry to get each building's bounding box,
-    // then add windows on its front face.
-    unsigned int wseed2 = 0xDEADBEEF; // fresh copy of the same seed
-
-    for (int i = 0; i < 120; i++) {
-        float width     = 10.f + frand(wseed2) * 120.f;
-        float height    = 150.f + frand(wseed2) * 1200.f;
-        float depth     = -600.f - frand(wseed2) * 1800.f;
-        float xPos      = -800.f + frand(wseed2) * 1600.f;
-        float thickness = 20.f + frand(wseed2) * 120.f;
-
-        // Front face of this building is at depth + thickness.
-        float face_z = depth + thickness;
-
-        // Window cell size scales with building width so grids look right.
-        float cell_w = width  / 12.f;
-        float cell_h = height / 80.f;
-        if (cell_w < 1.5f) cell_w = 1.5f;
-        if (cell_h < 1.5f) cell_h = 1.5f;
-
-        int wcols = (int)(width  / cell_w);
-        int wrows = (int)(height / cell_h);
-        if (wcols < 1) wcols = 1;
-        if (wrows < 1) wrows = 1;
-
-        float ww = cell_w * 0.50f;
-        float wh = cell_h * 0.52f;
-
+        float w  = 8.f  + frand(ws) * 80.f;
+        float h  = 10.f + frand(ws) * 55.f;
+        float d  = -620.f - frand(ws) * 1600.f;
+        float xp = -820.f + frand(ws) * 1640.f;
+        float th = 18.f + frand(ws) * 80.f;
+        float fz = d + th;
+        float cw = std::max(1.2f, w / 9.f);
+        float ch = std::max(1.2f, h / 40.f);
+        int wc = std::max(1, (int)(w / cw));
+        int wr = std::max(1, (int)(h / ch));
+        float ww = cw * 0.48f, wh = ch * 0.50f;
         unsigned int wsub = (unsigned int)(i * 1000003u + 7u);
-
-        for (int r = 0; r < wrows; r++) {
-            for (int c = 0; c < wcols; c++) {
-
-                // Skip ~45% of windows for a natural unlit-window pattern.
-                if (frand(wsub) < 0.45f) {
-                    continue;
-                }
-
-                float wx = xPos + c * cell_w;
-                float wy = -55.f + r * cell_h;
-
-                // Window sits flush on the front face, 0.5 units thick.
-                Box* win = new Box(
-                    Point3D(wx,      wy,      face_z),
-                    Point3D(wx + ww, wy + wh, face_z + 0.5f)
-                );
-
+        for (int r = 0; r < wr; r++) {
+            for (int c = 0; c < wc; c++) {
+                if (frand(wsub) < 0.45f) continue;
+                float wx = xp + c * cw;
+                float wy = -55.f + r * ch;
                 bool warm = frand(wsub) > 0.45f;
-                float bright = 0.6f + frand(wsub) * 1.8f;
-                win->set_material(new Emissive(warm ? winWarm : winPurple, bright));
+                float br = 0.4f + frand(wsub) * 1.4f;
+                Box* win = new Box(
+                    Point3D(wx,      wy,      fz),
+                    Point3D(wx + ww, wy + wh, fz + 0.5f));
+                win->set_material(new Emissive(warm ? winWarm : winPurple, br));
                 add_geometry(win);
             }
         }
     }
 
-    // ── Lights ───────────────────────────────────────────────────────────────
+    // ── RAIN ─────────────────────────────────────────────────────────────────
+    // Sphere-based droplets — soft glowing dots, NOT stiff rectangles.
+    // Each call places core + halo spheres, giving a natural bokeh-like look.
+    // All zones are inside the scene (z < 200).
+    // Brightness kept low so droplets are subtle against the dark sky.
 
-    // Deep purple ambient directional (moonlight).
-    add_light(new DirectionalLight(0.0f, -1.0f, -0.3f, 0.45f, 0.10f, 0.65f, 0.45f));
+    // Moonlit rain (pale blue-white, centre of scene).
+    rainField(*this, -220, 220, roofY, 155, -15, 195,
+              800, moonColor, 0.55f, seed);
 
-    // Neon point lights matching the signs.
-    add_light(new PointLight(Point3D(-162.f, 230.f, 200.f), neonMagenta, 140.f));
-    add_light(new PointLight(Point3D(-165.f, 167.f, 200.f), neonPurple,  135.f));
-    add_light(new PointLight(Point3D( 162.f, 242.f, 200.f), neonRed,     135.f));
-    add_light(new PointLight(Point3D( 165.f, 187.f, 200.f), neonOrange,  120.f));
-    add_light(new PointLight(Point3D(  37.f, 420.f,  25.f), neonMagenta, 120.f));
-    add_light(new PointLight(Point3D(  98.f, 380.f,  25.f), neonPurple,  110.f));
-    add_light(new PointLight(Point3D( -68.f, 275.f,  35.f), neonPink,    115.f));
-    add_light(new PointLight(Point3D( -17.f, 197.f,  65.f), neonOrange,  105.f));
-    add_light(new PointLight(Point3D( 136.f,  60.f,  15.f), winWarm,     100.f));
-    add_light(new PointLight(Point3D(-190.f, 330.f, 200.f), neonPurple,  120.f));
-    add_light(new PointLight(Point3D( 135.f, 320.f, 200.f), neonMagenta, 120.f));
-    add_light(new PointLight(Point3D(-100.f, 370.f,  65.f), neonOrange,  110.f));
+    // Left zone — purple tinted (near left neon signs).
+    rainField(*this, -320, -10, roofY, 120, -70, 140,
+              400, neonPurple, 0.45f, seed);
 
-    // ── BVH acceleration ─────────────────────────────────────────────────────
-    // To render WITHOUT acceleration (slow, for comparison table in report):
-    // comment out the three lines below and set accel_ptr = nullptr.
+    // Right zone — pink/orange tinted (near right neon signs).
+    rainField(*this, 10, 320, roofY, 120, -70, 140,
+              400, neonPink, 0.45f, seed);
+
+    // Mid-distance layer (fainter, smaller drops).
+    rainField(*this, -300, 300, roofY, 100, -280, -30,
+              600, RGBColor(0.55f, 0.30f, 0.80f), 0.28f, seed);
+
+    // Far background (very faint, deep purple).
+    rainField(*this, -380, 380, 0, 80, -580, -250,
+              500, RGBColor(0.30f, 0.02f, 0.48f), 0.18f, seed);
+
+    // ── LIGHTS ───────────────────────────────────────────────────────────────
+
+    // Moon: primary cool directional light from upper-left.
+    add_light(new DirectionalLight(
+        -0.25f, -1.0f, -0.35f,
+        moonColor.r, moonColor.g, moonColor.b,
+        0.60f));
+
+    // Dim purple ambient fill.
+    add_light(new DirectionalLight(
+        0.0f, -1.0f, 0.0f,
+        0.12f, 0.00f, 0.18f,
+        0.18f));
+
+    // Moon as point light (from moon sphere position).
+    add_light(new PointLight(Point3D(moonX, moonY, moonZ), moonColor, 200.f));
+
+    // Neon sign point lights.
+    add_light(new PointLight(Point3D(-160.f,  50.f, 200.f), neonMagenta, 125.f));
+    add_light(new PointLight(Point3D(-168.f,  12.f, 200.f), neonPurple,  115.f));
+    add_light(new PointLight(Point3D( 159.f,  61.f, 200.f), neonRed,     120.f));
+    add_light(new PointLight(Point3D( 165.f,  17.f, 200.f), neonOrange,  110.f));
+    add_light(new PointLight(Point3D(  25.f,  48.f,  25.f), neonMagenta, 110.f));
+    add_light(new PointLight(Point3D( 105.f,  38.f,  25.f), neonPurple,  100.f));
+    add_light(new PointLight(Point3D( -65.f,  22.f,  36.f), neonPink,    105.f));
+    add_light(new PointLight(Point3D(-100.f,  75.f,  65.f), neonOrange,   95.f));
+    add_light(new PointLight(Point3D( 135.f,  30.f, -16.f), neonYellow,   90.f));
+    add_light(new PointLight(Point3D(-185.f,  84.f, 200.f), neonPurple,  110.f));
+    add_light(new PointLight(Point3D( 134.f,  93.f, 200.f), neonMagenta, 110.f));
+
+    // Rooftop puddle fill lights — illuminate puddles and near rain drops.
+    add_light(new PointLight(Point3D( -80.f, roofY + 4.f, 215.f), neonMagenta, 70.f));
+    add_light(new PointLight(Point3D(  40.f, roofY + 4.f, 215.f), neonPurple,  65.f));
+    add_light(new PointLight(Point3D( 140.f, roofY + 4.f, 215.f), neonOrange,  60.f));
+    add_light(new PointLight(Point3D(   0.f, roofY + 4.f, 225.f), moonColor,   55.f));
+
+    // ── BVH ──────────────────────────────────────────────────────────────────
     BVH* bvh = new BVH();
     bvh->build(geometry);
     accel_ptr = bvh;
 }
-
-// Compile:
-// g++ -O2 -std=c++17 \
-//   -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk \
-//   -I/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk/usr/include/c++/v1 \
-//   -stdlib=libc++ \
-//   raytracer.cpp world/*.cpp utilities/*.cpp geometry/*.cpp cameras/*.cpp \
-//   image/*.cpp samplers/*.cpp materials/*.cpp acceleration/BVH.cpp \
-//   build/NightCity.cpp -o raytracer.exe
